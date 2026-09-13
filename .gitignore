@@ -1,0 +1,14 @@
+# 密钥和配置，绝对不要上传到 GitHub
+config.json
+*.key
+.env
+
+# 运行产生的输出
+output/
+dist/
+__pycache__/
+*.pyc
+
+# 系统文件
+.DS_Store
+Thumbs.db
