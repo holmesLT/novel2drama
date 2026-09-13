@@ -113,12 +113,12 @@ def build_user_prompt(text, next_scene_id):
 # LLM 调用（OpenAI 兼容接口）
 # ---------------------------------------------------------------------------
 
-def call_llm(config, user_prompt, timeout=180):
+def call_llm(config, user_prompt, timeout=180, system_prompt=SYSTEM_PROMPT):
     url = config["api_base"].rstrip("/") + "/chat/completions"
     payload = json.dumps({
         "model": config["model"],
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": 0.7,
