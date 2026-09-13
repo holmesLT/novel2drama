@@ -1,5 +1,13 @@
 {
   "api_base": "https://open.bigmodel.cn/api/paas/v4",
   "api_key": "在这里填入你的 API Key",
-  "model": "glm-4-flash"
+  "model": "glm-4-flash",
+  "video_model": "cogvideox-flash",
+  "tts_backend": "glm-tts",
+  "tts_model": "glm-tts",
+  "voices": {
+    "林晚": "tongtong",
+    "陈默": "xiaochen"
+  },
+  "macsay_voice": "Tingting"
 }

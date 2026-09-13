@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+render —— 第三步：把分镜（storyboard.json）合成为成片
+
+流程：逐镜头生成视频（智谱 CogVideoX）→ 逐镜头生成配音（智谱 GLM-TTS）
+     → FFmpeg 音画对齐并按顺序拼接成片。
+
+只依赖 Python 标准库 + 系统命令 ffmpeg/ffprobe。
+
+用法:
+    python3 render.py output/小说.storyboard.json
+    python3 render.py output/小说.storyboard.json --shots S1-01,S1-02   # 只渲染部分镜头
+    python3 render.py output/小说.storyboard.json --skip-video          # 只重做配音和拼接
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+
+import novel2drama as n2d  # 复用配置加载和 SSL 自愈逻辑
+
+POLL_INTERVAL = 10          # 秒，视频生成任务轮询间隔
+POLL_TIMEOUT = 1200         # 秒，单镜头视频生成超时
+PROMPT_MAX = 512            # 视频 API 提示词长度上限
+GAP_SEC = 0.4               # 镜头内多句台词之间的停顿
+
+# 没有在 config 中指定音色的角色，按顺序使用这些默认音色
+FALLBACK_VOICES = ["tongtong", "xiaochen", "chuichui", "jam"]
+
+
+# ---------------------------------------------------------------------------
+# 智谱异步/二进制接口
+# ---------------------------------------------------------------------------
+
+def api_post_json(config, path, payload):
+    request = urllib.request.Request(
+        config["api_base"].rstrip("/") + path,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + config["api_key"]},
+        method="POST",
+    )
+    with n2d.urlopen_with_retry(request) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def generate_video_clip(config, shot, out_path):
+    """提交文生视频任务并轮询到完成，下载视频到 out_path。"""
+    payload = {
+        "model": config.get("video_model", "cogvideox-flash"),
+        "prompt": shot.get("video_prompt", "")[:PROMPT_MAX],
+        "quality": "speed",
+        "size": "1920x1080",
+    }
+    if config.get("video_model", "").startswith("cogvideox-3"):
+        payload["duration"] = 5 if shot.get("duration_sec", 5) <= 5 else 10
+
+    print(f"    提交生成任务（{payload['model']}）…")
+    resp = api_post_json(config, "/videos/generations", payload)
+    task_id = resp.get("id")
+    if not task_id:
+        raise RuntimeError(f"视频任务提交失败：{json.dumps(resp, ensure_ascii=False)[:300]}")
+
+    deadline = time.time() + POLL_TIMEOUT
+    while True:
+        time.sleep(POLL_INTERVAL)
+        req = urllib.request.Request(
+            config["api_base"].rstrip("/") + "/async-result/" + task_id,
+            headers={"Authorization": "Bearer " + config["api_key"]},
+        )
+        with n2d.urlopen_with_retry(req) as response:
+            result = json.loads(response.read().decode("utf-8"))
+        status = result.get("task_status")
+        if status == "SUCCESS":
+            videos = result.get("video_result") or []
+            if not videos or not videos[0].get("url"):
+                raise RuntimeError(f"任务 {task_id} 成功但没有视频 URL")
+            url = videos[0]["url"]
+            print(f"    生成完成，下载中…")
+            with n2d.urlopen_with_retry(urllib.request.Request(url)) as response, \
+                    open(out_path, "wb") as f:
+                f.write(response.read())
+            return
+        if status == "FAIL":
+            raise RuntimeError(f"视频生成失败（任务 {task_id}）：{json.dumps(result, ensure_ascii=False)[:300]}")
+        if time.time() > deadline:
+            raise RuntimeError(f"视频生成超时（任务 {task_id}），稍后可用 --force 重试该镜头")
+        print(f"    生成中…（已等待 {int(time.time() - (deadline - POLL_TIMEOUT))} 秒）")
+
+
+def synthesize_dialogue(config, lines, voice_of, out_path):
+    """把一个镜头的多句台词合成为一段配音 WAV。
+
+    两种后端（config 的 tts_backend 字段）：
+    - "glm-tts"：智谱 GLM-TTS 接口，音质好，按用量计费；
+    - "macsay"：macOS 系统自带 say 命令，免费离线，但只有单一音色。
+    """
+    backend = config.get("tts_backend", "glm-tts")
+    parts = []
+    for line in lines:
+        text = line.get("text", "").strip()
+        if not text:
+            continue
+        part_path = out_path + f".part{len(parts)}.wav"
+        if backend == "macsay":
+            subprocess.run(
+                ["say", "-v", config.get("macsay_voice", "Tingting"),
+                 "--data-format=LEI16@24000", "-o", part_path, text],
+                check=True,
+            )
+        else:
+            voice = voice_of(line.get("character", ""))
+            request = urllib.request.Request(
+                config["api_base"].rstrip("/") + "/audio/speech",
+                data=json.dumps({
+                    "model": config.get("tts_model", "glm-tts"),
+                    "input": text,
+                    "voice": voice,
+                    "response_format": "wav",
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json",
+                         "Authorization": "Bearer " + config["api_key"]},
+                method="POST",
+            )
+            with n2d.urlopen_with_retry(request) as response:
+                audio = response.read()
+            with open(part_path, "wb") as f:
+                f.write(audio)
+        parts.append(part_path)
+
+    if not parts:
+        return False
+    if len(parts) == 1:
+        os.replace(parts[0], out_path)
+        return True
+    # 多句台词：静音间隔后拼接
+    inputs, gaps = [], []
+    for i, p in enumerate(parts):
+        inputs += ["-i", p]
+        if i:
+            gaps.append("anullsrc=r=24000:cl=mono:d=%g[s%d];[a%d][s%d]" % (GAP_SEC, i, i, i))
+    filter_complex = ";".join(gaps) + f";{''.join('[a%d]' % i for i in range(len(parts)))}concat=n={len(parts)}:v=0:a=1[out]"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", *inputs,
+         "-filter_complex", filter_complex, "-map", "[out]", out_path],
+        check=True,
+    )
+    for p in parts:
+        os.remove(p)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# FFmpeg 拼接
+# ---------------------------------------------------------------------------
+
+def probe_duration(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+        capture_output=True, text=True, check=True,
+    )
+    return float(result.stdout.strip())
+
+
+def build_segment(clip_path, audio_path, out_path):
+    """把一个镜头标准化为统一编码参数的片段（音画对齐、静音补足）。"""
+    dur = probe_duration(clip_path)
+    if audio_path and os.path.isfile(audio_path):
+        afilter = f"[1:a]apad=whole_dur={dur + 0.5}[a]"
+        ainput = ["-i", audio_path]
+        amap = "[a]"
+    else:
+        afilter = None
+        ainput = ["-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono"]
+        amap = "1:a"
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", clip_path, *ainput]
+    if afilter:
+        cmd += ["-filter_complex", afilter, "-map", "0:v", "-map", amap]
+    else:
+        cmd += ["-map", "0:v", "-map", amap, "-shortest"]
+    cmd += ["-t", f"{dur:.3f}", "-r", "30",
+            "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ar", "24000", "-ac", "1",
+            "-movflags", "+faststart", out_path]
+    subprocess.run(cmd, check=True)
+
+
+def concat_segments(segment_paths, out_path, workdir):
+    list_path = os.path.join(workdir, "concat.txt")
+    with open(list_path, "w", encoding="utf-8") as f:
+        for p in segment_paths:
+            f.write("file '%s'\n" % os.path.abspath(p).replace("'", "'\\''"))
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+         "-i", list_path, "-c", "copy", out_path],
+        check=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="render —— 把分镜（storyboard.json）合成为成片",
+        epilog="示例:\n  python3 render.py output/小说.storyboard.json\n"
+               "  python3 render.py output/小说.storyboard.json --shots S1-01,S1-02",
+    )
+    parser.add_argument("input", help="分镜 JSON 文件（第二步的输出）")
+    parser.add_argument("-o", "--workdir", default=None, help="工作目录（默认 output/render_<名称>/）")
+    parser.add_argument("--shots", help="只渲染指定镜头，逗号分隔，如 S1-01,S2-03")
+    parser.add_argument("--force", action="store_true", help="忽略已生成的片段，全部重做")
+    parser.add_argument("--skip-video", action="store_true", help="跳过视频生成，使用已有片段")
+    parser.add_argument("--config", help="配置文件路径")
+    args = parser.parse_args()
+
+    config = n2d.load_config(args.config)
+
+    try:
+        with open(args.input, "r", encoding="utf-8") as f:
+            storyboard = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[错误] 无法读取分镜文件 {args.input}：{exc}", file=sys.stderr)
+        sys.exit(1)
+    if "scenes" not in storyboard:
+        print("[错误] 这不是分镜 JSON（缺少 scenes 字段）", file=sys.stderr)
+        sys.exit(1)
+
+    only = set(s.strip() for s in args.shots.split(",")) if args.shots else None
+    shots = []
+    for scene in storyboard.get("scenes", []):
+        for shot in scene.get("shots", []):
+            if only is None or shot.get("shot_id") in only:
+                shots.append(shot)
+    if not shots:
+        print("[错误] 没有匹配的镜头", file=sys.stderr)
+        sys.exit(1)
+
+    if not config["api_key"] and not args.skip_video:
+        print("[错误] 尚未配置 API Key（需要同时用于视频生成和配音）。", file=sys.stderr)
+        sys.exit(1)
+    for tool in ("ffmpeg", "ffprobe"):
+        if not args.skip_video and subprocess.run(["which", tool], capture_output=True).returncode != 0:
+            print(f"[错误] 未找到 {tool}，请先安装：brew install ffmpeg", file=sys.stderr)
+            sys.exit(1)
+
+    stem = os.path.splitext(os.path.basename(args.input))[0].replace(".storyboard", "")
+    workdir = args.workdir or os.path.join("output", "render_" + stem)
+    clips_dir = os.path.join(workdir, "clips")
+    audio_dir = os.path.join(workdir, "audio")
+    build_dir = os.path.join(workdir, "build")
+    for d in (clips_dir, audio_dir, build_dir):
+        os.makedirs(d, exist_ok=True)
+
+    # 角色音色分配
+    voice_map = dict(config.get("voices", {}))
+    fallback_index = 0
+
+    def voice_of(character):
+        nonlocal fallback_index
+        if character in voice_map:
+            return voice_map[character]
+        voice = FALLBACK_VOICES[fallback_index % len(FALLBACK_VOICES)]
+        fallback_index += 1
+        voice_map[character] = voice
+        return voice
+
+    total_cost_shots = sum(1 for s in shots if not os.path.isfile(os.path.join(clips_dir, s["shot_id"] + ".mp4")) or args.force)
+    print(f"[计划] 共 {len(shots)} 个镜头，其中 {total_cost_shots} 个需要生成视频"
+          f"（模型 {config.get('video_model', 'cogvideox-flash')}"
+          f"{'，免费' if config.get('video_model', 'cogvideox-flash') == 'cogvideox-flash' else '，注意计费'}）")
+
+    segments = []
+    for i, shot in enumerate(shots, 1):
+        sid = shot.get("shot_id", f"shot{i:02d}")
+        print(f"[镜头 {sid}]（{i}/{len(shots)}）{shot.get('description', '')[:40]}…")
+        clip_path = os.path.join(clips_dir, sid + ".mp4")
+        audio_path = os.path.join(audio_dir, sid + ".wav")
+
+        if not args.skip_video:
+            if os.path.isfile(clip_path) and not args.force:
+                print("    已有视频片段，跳过生成（--force 可重做）")
+            else:
+                try:
+                    generate_video_clip(config, shot, clip_path)
+                except RuntimeError as exc:
+                    print(f"[错误] {exc}", file=sys.stderr)
+                    sys.exit(1)
+
+        if os.path.isfile(audio_path) and not args.force:
+            print("    已有配音，跳过")
+        elif shot.get("dialogue"):
+            print(f"    生成配音（{len(shot['dialogue'])} 句台词）…")
+            try:
+                has_audio = synthesize_dialogue(config, shot["dialogue"], voice_of, audio_path)
+            except (RuntimeError, subprocess.CalledProcessError) as exc:
+                print(f"[警告] 镜头 {sid} 配音失败，该镜头将无声音：{exc}", file=sys.stderr)
+                has_audio = False
+            if not has_audio:
+                audio_path = None
+        else:
+            audio_path = None
+
+        seg_path = os.path.join(build_dir, f"{i:03d}_{sid}.mp4")
+        try:
+            build_segment(clip_path, audio_path, seg_path)
+        except subprocess.CalledProcessError as exc:
+            print(f"[错误] 镜头 {sid} 音画合成失败：{exc}", file=sys.stderr)
+            sys.exit(1)
+        segments.append(seg_path)
+
+    final_path = os.path.join(workdir, stem + ".成片.mp4")
+    print("[拼接] 合成成片…")
+    concat_segments(segments, final_path, workdir)
+    dur = probe_duration(final_path)
+    size_mb = os.path.getsize(final_path) / 1024 / 1024
+    print(f"[完成] 成片：{final_path}")
+    print(f"  时长 {int(dur // 60)} 分 {dur % 60:.0f} 秒，大小 {size_mb:.1f} MB")
+    print("\n提示：片段已缓存在工作目录中，修改某几个镜头后可用 --shots 单独重渲染。")
+
+
+if __name__ == "__main__":
+    main()

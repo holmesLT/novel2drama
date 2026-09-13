@@ -113,6 +113,27 @@ def build_user_prompt(text, next_scene_id):
 # LLM 调用（OpenAI 兼容接口）
 # ---------------------------------------------------------------------------
 
+def urlopen_with_retry(request, timeout=180):
+    """打开 URL；遇到 SSL 证书问题时尝试用 certifi 重试并给出修复指引。"""
+    try:
+        return urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        # macOS 上 python.org 版 Python 常见问题：SSL 根证书未安装。
+        if isinstance(reason, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(reason):
+            try:
+                import certifi
+                context = ssl.create_default_context(cafile=certifi.where())
+                return urllib.request.urlopen(request, timeout=timeout, context=context)
+            except ImportError:
+                raise RuntimeError(
+                    "SSL 证书校验失败。修复方法（macOS）：\n"
+                    "  打开文件夹 /Applications/Python 3.12，双击运行"
+                    "「Install Certificates.command」"
+                ) from exc
+        raise
+
+
 def call_llm(config, user_prompt, timeout=180, system_prompt=SYSTEM_PROMPT):
     url = config["api_base"].rstrip("/") + "/chat/completions"
     payload = json.dumps({
@@ -134,28 +155,8 @@ def call_llm(config, user_prompt, timeout=180, system_prompt=SYSTEM_PROMPT):
         method="POST",
     )
 
-    def _open(req):
-        try:
-            return urllib.request.urlopen(req, timeout=timeout)
-        except urllib.error.URLError as exc:
-            reason = getattr(exc, "reason", exc)
-            # macOS 上 python.org 版 Python 常见问题：SSL 根证书未安装。
-            # 此时尝试改用 pip 自带的 certifi 证书库重试一次。
-            if isinstance(reason, ssl.SSLError) and "CERTIFICATE_VERIFY_FAILED" in str(reason):
-                try:
-                    import certifi
-                    context = ssl.create_default_context(cafile=certifi.where())
-                    return urllib.request.urlopen(req, timeout=timeout, context=context)
-                except ImportError:
-                    raise RuntimeError(
-                        "SSL 证书校验失败。修复方法（macOS）：\n"
-                        "  打开文件夹 /Applications/Python 3.12，双击运行"
-                        "「Install Certificates.command」"
-                    ) from exc
-            raise
-
     try:
-        with _open(request) as response:
+        with urlopen_with_retry(request, timeout=timeout) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")[:500]
