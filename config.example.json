@@ -3,6 +3,8 @@
   "api_key": "在这里填入你的 API Key",
   "model": "glm-4-flash",
   "video_model": "cogvideox-flash",
+  "image_model": "cogview-3-flash",
+  "lock_characters": true,
   "tts_backend": "glm-tts",
   "tts_model": "glm-tts",
   "voices": {

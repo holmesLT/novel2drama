@@ -15,6 +15,7 @@ render —— 第三步：把分镜（storyboard.json）合成为成片
 """
 
 import argparse
+import base64
 import json
 import os
 import subprocess
@@ -49,8 +50,32 @@ def api_post_json(config, path, payload):
         return json.loads(response.read().decode("utf-8"))
 
 
-def generate_video_clip(config, shot, out_path):
-    """提交文生视频任务并轮询到完成，下载视频到 out_path。"""
+def generate_portrait(config, character, out_path):
+    """用 CogView 为角色生成定妆照（appearance 锁定外貌 + 统一风格）。"""
+    prompt = (
+        f"{character.get('appearance', character.get('desc', ''))}，"
+        f"单人定妆照，半身像，面向镜头，表情自然，纯浅灰色背景，"
+        f"柔和影棚灯光，写实电影风格，高清细节"
+    )
+    payload = {
+        "model": config.get("image_model", "cogview-3-flash"),
+        "prompt": prompt[:PROMPT_MAX],
+        "size": "1024x1024",
+    }
+    resp = api_post_json(config, "/images/generations", payload)
+    images = resp.get("data") or []
+    if not images or not images[0].get("url"):
+        raise RuntimeError(f"定妆照生成失败：{json.dumps(resp, ensure_ascii=False)[:300]}")
+    with n2d.urlopen_with_retry(urllib.request.Request(images[0]["url"])) as response, \
+            open(out_path, "wb") as f:
+        f.write(response.read())
+
+
+def generate_video_clip(config, shot, out_path, portrait_path=None):
+    """提交视频生成任务并轮询到完成，下载视频到 out_path。
+
+    portrait_path 非空时使用图生视频：定妆照作为首帧，锁定人物形象。
+    """
     payload = {
         "model": config.get("video_model", "cogvideox-flash"),
         "prompt": shot.get("video_prompt", "")[:PROMPT_MAX],
@@ -59,8 +84,12 @@ def generate_video_clip(config, shot, out_path):
     }
     if config.get("video_model", "").startswith("cogvideox-3"):
         payload["duration"] = 5 if shot.get("duration_sec", 5) <= 5 else 10
+    if portrait_path:
+        with open(portrait_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("ascii")
+        payload["image_url"] = "data:image/png;base64," + b64
 
-    print(f"    提交生成任务（{payload['model']}）…")
+    print(f"    提交生成任务（{payload['model']}{'，图生视频锁定人物' if portrait_path else ''}）…")
     resp = api_post_json(config, "/videos/generations", payload)
     task_id = resp.get("id")
     if not task_id:
@@ -229,6 +258,7 @@ def main():
     parser.add_argument("--shots", help="只渲染指定镜头，逗号分隔，如 S1-01,S2-03")
     parser.add_argument("--force", action="store_true", help="忽略已生成的片段，全部重做")
     parser.add_argument("--skip-video", action="store_true", help="跳过视频生成，使用已有片段")
+    parser.add_argument("--lock", action="store_true", help="定妆照锁定：为角色生成定妆照，人物镜头改用图生视频（也可在 config 里设 lock_characters: true）")
     parser.add_argument("--config", help="配置文件路径")
     args = parser.parse_args()
 
@@ -292,6 +322,41 @@ def main():
         macsay_map[character] = cfg
         return cfg
 
+    # 定妆照锁定：人物镜头用图生视频（定妆照作首帧）
+    lock = args.lock or bool(config.get("lock_characters"))
+    portraits = {}
+    if lock and not args.skip_video:
+        portrait_dir = os.path.join(workdir, "characters")
+        os.makedirs(portrait_dir, exist_ok=True)
+        print(f"[定妆照] 为 {len(storyboard.get('characters', []))} 个角色生成参考图…")
+        for c in storyboard.get("characters", []):
+            name = c.get("name", "")
+            if not name:
+                continue
+            p = os.path.join(portrait_dir, name + ".png")
+            if os.path.isfile(p) and not args.force:
+                print(f"    {name}：已有定妆照，跳过")
+            else:
+                try:
+                    generate_portrait(config, c, p)
+                    print(f"    {name}：已生成")
+                except RuntimeError as exc:
+                    print(f"[警告] {name} 定妆照生成失败，该角色回退纯文生视频：{exc}", file=sys.stderr)
+                    continue
+            portraits[name] = p
+
+    def portrait_for(shot):
+        """找出镜头中的人物（台词角色优先），返回其定妆照路径。"""
+        names = [d.get("character") for d in shot.get("dialogue", []) if d.get("character")]
+        text = shot.get("description", "") + shot.get("video_prompt", "")
+        for name in portraits:
+            if name in text and name not in names:
+                names.append(name)
+        for name in names:
+            if name in portraits:
+                return portraits[name]
+        return None
+
     total_cost_shots = sum(1 for s in shots if not os.path.isfile(os.path.join(clips_dir, s["shot_id"] + ".mp4")) or args.force)
     print(f"[计划] 共 {len(shots)} 个镜头，其中 {total_cost_shots} 个需要生成视频"
           f"（模型 {config.get('video_model', 'cogvideox-flash')}"
@@ -309,7 +374,7 @@ def main():
                 print("    已有视频片段，跳过生成（--force 可重做）")
             else:
                 try:
-                    generate_video_clip(config, shot, clip_path)
+                    generate_video_clip(config, shot, clip_path, portrait_for(shot))
                 except RuntimeError as exc:
                     print(f"[错误] {exc}", file=sys.stderr)
                     sys.exit(1)
