@@ -93,12 +93,13 @@ def generate_video_clip(config, shot, out_path):
         print(f"    生成中…（已等待 {int(time.time() - (deadline - POLL_TIMEOUT))} 秒）")
 
 
-def synthesize_dialogue(config, lines, voice_of, out_path):
+def synthesize_dialogue(config, lines, voice_of, macsay_voice_of, out_path):
     """把一个镜头的多句台词合成为一段配音 WAV。
 
     两种后端（config 的 tts_backend 字段）：
     - "glm-tts"：智谱 GLM-TTS 接口，音质好，按用量计费；
-    - "macsay"：macOS 系统自带 say 命令，免费离线，但只有单一音色。
+    - "macsay"：macOS 系统自带 say 命令，免费离线；通过 macsay_voices 配置
+      每个角色的 voice 和 pitch（pitch<1 降调，用于没有男声系统时的男角色变声）。
     """
     backend = config.get("tts_backend", "glm-tts")
     parts = []
@@ -108,11 +109,22 @@ def synthesize_dialogue(config, lines, voice_of, out_path):
             continue
         part_path = out_path + f".part{len(parts)}.wav"
         if backend == "macsay":
+            voice_cfg = macsay_voice_of(line.get("character", ""))
             subprocess.run(
-                ["say", "-v", config.get("macsay_voice", "Tingting"),
+                ["say", "-v", voice_cfg.get("voice", config.get("macsay_voice", "Tingting")),
                  "--data-format=LEI16@24000", "-o", part_path, text],
                 check=True,
             )
+            pitch = float(voice_cfg.get("pitch", 1.0))
+            if abs(pitch - 1.0) > 0.01:
+                # asetrate 降低音调，atempo 补偿语速，使变调不变速
+                subprocess.run(
+                    ["ffmpeg", "-y", "-loglevel", "error", "-i", part_path,
+                     "-af", "asetrate=24000*%g,aresample=24000,atempo=%.4f" % (pitch, 1 / pitch),
+                     "-c:a", "pcm_s16le", part_path + ".pitched.wav"],
+                    check=True,
+                )
+                os.replace(part_path + ".pitched.wav", part_path)
         else:
             voice = voice_of(line.get("character", ""))
             request = urllib.request.Request(
@@ -260,6 +272,7 @@ def main():
 
     # 角色音色分配
     voice_map = dict(config.get("voices", {}))
+    macsay_map = {k: dict(v) for k, v in (config.get("macsay_voices") or {}).items()}
     fallback_index = 0
 
     def voice_of(character):
@@ -270,6 +283,14 @@ def main():
         fallback_index += 1
         voice_map[character] = voice
         return voice
+
+    def macsay_voice_of(character):
+        if character in macsay_map:
+            return macsay_map[character]
+        # 未配置的角色：默认系统音色、不变调
+        cfg = {"voice": config.get("macsay_voice", "Tingting"), "pitch": 1.0}
+        macsay_map[character] = cfg
+        return cfg
 
     total_cost_shots = sum(1 for s in shots if not os.path.isfile(os.path.join(clips_dir, s["shot_id"] + ".mp4")) or args.force)
     print(f"[计划] 共 {len(shots)} 个镜头，其中 {total_cost_shots} 个需要生成视频"
@@ -298,7 +319,7 @@ def main():
         elif shot.get("dialogue"):
             print(f"    生成配音（{len(shot['dialogue'])} 句台词）…")
             try:
-                has_audio = synthesize_dialogue(config, shot["dialogue"], voice_of, audio_path)
+                has_audio = synthesize_dialogue(config, shot["dialogue"], voice_of, macsay_voice_of, audio_path)
             except (RuntimeError, subprocess.CalledProcessError) as exc:
                 print(f"[警告] 镜头 {sid} 配音失败，该镜头将无声音：{exc}", file=sys.stderr)
                 has_audio = False

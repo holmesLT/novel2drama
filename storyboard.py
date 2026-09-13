@@ -45,10 +45,12 @@ STORYBOARD_SYSTEM_PROMPT = """你是一位专业的短剧分镜师。你的任�
 1. shot_id 格式为 S{场景号}-{两位序号}，例如 S3-01、S3-02。
 2. 每个镜头 duration_sec 在 3 到 8 秒之间；台词按正常语速估算时长，一行短台词约 2-4 秒。
 3. shot_type 使用景别（远景/全景/中景/近景/特写）或运镜（推、拉、摇、跟）。
-4. video_prompt 必须自包含：把景别、主体及其外貌特征、动作、环境、光线、氛围整合成一段完整描述，不依赖其他镜头的上下文；风格关键词参考全片视觉风格。
-5. 场景 beats 中所有台词必须分配到某个镜头的 dialogue 里，顺序不变；不要新增剧本中不存在的台词，也不要改动台词原文。
-6. 画面描述必须符合物理逻辑和空间常识（人物站在地板上而不是家具上、物体位置前后一致）；同一场景中角色的外貌特征要保持一致。
-7. 只输出 JSON，第一个字符必须是 { ，最后一个字符必须是 } 。"""
+4. video_prompt 必须自包含：把景别、主体、动作、环境、光线、氛围整合成一段完整描述，不依赖其他镜头的上下文；风格关键词参考全片视觉风格。
+5. 人物形象一致性（最重要）：凡镜头画面中出现某角色，必须把该角色 appearance 字段的原文一字不差地嵌入 video_prompt 中，并紧跟在角色名之后；appearance 原文是保证跨镜头人物形象一致的唯一手段，绝不可改写、缩写或省略。纯景物/空镜镜头无需嵌入。
+6. 台词分配：每句台词必须放在说话人可见的近景/特写镜头中（或至少是说话人位于画面主体位置的中景），不要把台词放在纯景物或说话人不在画面的镜头上。
+7. 场景 beats 中所有台词必须分配到某个镜头的 dialogue 里，顺序不变；不要新增剧本中不存在的台词，也不要改动台词原文。
+8. 画面描述必须符合物理逻辑和空间常识（人物站在地板上而不是家具上、物体位置前后一致）；同一场景中角色的外貌特征要保持一致。
+9. 只输出 JSON，第一个字符必须是 { ，最后一个字符必须是 } 。"""
 
 
 def build_scene_prompt(scene, episode, scene_no):
@@ -75,7 +77,8 @@ def build_scene_prompt(scene, episode, scene_no):
 # 校验与渲染
 # ---------------------------------------------------------------------------
 
-def validate_shots(shots, scene_no, character_names):
+def validate_shots(shots, scene_no, characters):
+    """characters: {name: appearance} 映射。返回 (shots, problems)。"""
     problems = []
     seen_ids = set()
     for shot in shots:
@@ -87,11 +90,17 @@ def validate_shots(shots, scene_no, character_names):
         if not isinstance(dur, (int, float)) or not 1 <= dur <= 30:
             problems.append(f"镜头 {sid} 时长异常：{dur}")
             shot["duration_sec"] = 5
-        for d in shot.get("dialogue", []):
-            if d.get("character") not in character_names:
-                problems.append(f"镜头 {sid} 台词角色「{d.get('character')}」不在角色表里")
-        if not shot.get("video_prompt"):
+        prompt = shot.get("video_prompt", "")
+        if not prompt:
             problems.append(f"镜头 {sid} 缺少 video_prompt")
+        for d in shot.get("dialogue", []):
+            name = d.get("character")
+            if name not in characters:
+                problems.append(f"镜头 {sid} 台词角色「{name}」不在角色表里")
+            elif characters[name] and characters[name][:12] not in prompt:
+                # 自动修复：把锁定外貌补写进提示词
+                shot["video_prompt"] = prompt.rstrip("。；;，, ") + f"。画面中{name}的形象：{characters[name]}。"
+                problems.append(f"镜头 {sid} 的 video_prompt 漏嵌「{name}」的锁定外貌，已自动补写")
     return shots, problems
 
 
@@ -154,7 +163,7 @@ DEMO_SCENE_SHOTS = {
 # ---------------------------------------------------------------------------
 
 def episode_to_storyboard(episode):
-    character_names = {c.get("name") for c in episode.get("characters", [])}
+    characters = {c.get("name"): c.get("appearance", "") for c in episode.get("characters", [])}
     storyboard = {
         "title": episode.get("title", ""),
         "genre": episode.get("genre", ""),
@@ -173,7 +182,7 @@ def episode_to_storyboard(episode):
             system_prompt=STORYBOARD_SYSTEM_PROMPT,
         )
         shots = n2d.extract_json(content).get("shots", [])
-        shots, problems = validate_shots(shots, scene_no, character_names)
+        shots, problems = validate_shots(shots, scene_no, characters)
         for p in problems:
             print(f"[警告] {p}", file=sys.stderr)
         all_problems += problems

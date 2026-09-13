@@ -9,5 +9,8 @@
     "林晚": "tongtong",
     "陈默": "xiaochen"
   },
-  "macsay_voice": "Tingting"
+  "macsay_voice": "Tingting",
+  "macsay_voices": {
+    "角色名": {"voice": "Tingting", "pitch": 0.78}
+  }
 }

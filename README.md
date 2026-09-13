@@ -93,6 +93,19 @@ python3 render.py output/sample_novel.storyboard.json
 
 **成本提示**：默认模型 `cogvideox-flash` 免费；切换到 `cogvideox-3` 等付费模型前请先了解 [智谱定价](https://open.bigmodel.cn/pricing)。片段缓存意味着只有新镜头才会产生费用。
 
+## 🎭 人物形象一致性与配音
+
+**人物一致性**是 AI 短剧最大的难点：视频模型每次生成都是独立的，同一角色容易在不同镜头里"换脸换人"。novel2drama 的方案：
+
+1. 第一步为每个角色生成一份**锁定外貌**（`appearance` 字段：国籍、年龄、发型、服装），并要求符合小说的时代与地域设定；
+2. 第二步把这份外貌**逐字嵌入**每个出现该角色的镜头提示词，漏嵌会被校验器自动补写；
+3. 你可以手工修改 `episode.json` 里的 `appearance`（改得更具体、更独特，一致性更好），然后重跑第二、三步。
+
+**配音**与画面匹配：
+
+- `glm-tts` 后端：通过 `voices` 字段给每个角色分配不同音色（`tongtong`/`xiaochen` 等）；
+- `macsay` 后端（免费）：macOS 没有男声中文音色，通过 `macsay_voices` 给角色设置 `pitch`（如男角色 `0.78` 降调变声）解决音色单一问题。
+
 ## 📖 使用自己的小说
 
 ```bash
