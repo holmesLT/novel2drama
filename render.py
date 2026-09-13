@@ -208,6 +208,15 @@ def probe_duration(path):
     return float(result.stdout.strip())
 
 
+def extract_last_frame(clip_path, out_path):
+    """抽取视频最后一帧，供下一个镜头做首帧接续。"""
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-sseof", "-0.2",
+         "-i", clip_path, "-frames:v", "1", "-q:v", "2", out_path],
+        check=True,
+    )
+
+
 def build_segment(clip_path, audio_path, out_path):
     """把一个镜头标准化为统一编码参数的片段（音画对齐、静音补足）。"""
     dur = probe_duration(clip_path)
@@ -259,6 +268,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="忽略已生成的片段，全部重做")
     parser.add_argument("--skip-video", action="store_true", help="跳过视频生成，使用已有片段")
     parser.add_argument("--lock", action="store_true", help="定妆照锁定：为角色生成定妆照，人物镜头改用图生视频（也可在 config 里设 lock_characters: true）")
+    parser.add_argument("--chain", action="store_true", help="尾帧接续：同一场景内，下一镜头以上一镜头的末帧为首帧（也可在 config 里设 chain_shots: true）")
     parser.add_argument("--config", help="配置文件路径")
     args = parser.parse_args()
 
@@ -275,12 +285,12 @@ def main():
         sys.exit(1)
 
     only = set(s.strip() for s in args.shots.split(",")) if args.shots else None
-    shots = []
+    scene_shots = []
     for scene in storyboard.get("scenes", []):
         for shot in scene.get("shots", []):
             if only is None or shot.get("shot_id") in only:
-                shots.append(shot)
-    if not shots:
+                scene_shots.append((scene.get("scene_id"), shot))
+    if not scene_shots:
         print("[错误] 没有匹配的镜头", file=sys.stderr)
         sys.exit(1)
 
@@ -297,7 +307,8 @@ def main():
     clips_dir = os.path.join(workdir, "clips")
     audio_dir = os.path.join(workdir, "audio")
     build_dir = os.path.join(workdir, "build")
-    for d in (clips_dir, audio_dir, build_dir):
+    frames_dir = os.path.join(workdir, "frames")
+    for d in (clips_dir, audio_dir, build_dir, frames_dir):
         os.makedirs(d, exist_ok=True)
 
     # 角色音色分配
@@ -357,15 +368,18 @@ def main():
                 return portraits[name]
         return None
 
-    total_cost_shots = sum(1 for s in shots if not os.path.isfile(os.path.join(clips_dir, s["shot_id"] + ".mp4")) or args.force)
-    print(f"[计划] 共 {len(shots)} 个镜头，其中 {total_cost_shots} 个需要生成视频"
+    total_cost_shots = sum(1 for _, s in scene_shots if not os.path.isfile(os.path.join(clips_dir, s["shot_id"] + ".mp4")) or args.force)
+    print(f"[计划] 共 {len(scene_shots)} 个镜头，其中 {total_cost_shots} 个需要生成视频"
           f"（模型 {config.get('video_model', 'cogvideox-flash')}"
           f"{'，免费' if config.get('video_model', 'cogvideox-flash') == 'cogvideox-flash' else '，注意计费'}）")
 
     segments = []
-    for i, shot in enumerate(shots, 1):
+    chain = args.chain or bool(config.get("chain_shots"))
+    prev_scene = None
+    prev_frame = None
+    for i, (scene_id, shot) in enumerate(scene_shots, 1):
         sid = shot.get("shot_id", f"shot{i:02d}")
-        print(f"[镜头 {sid}]（{i}/{len(shots)}）{shot.get('description', '')[:40]}…")
+        print(f"[镜头 {sid}]（{i}/{len(scene_shots)}）{shot.get('description', '')[:40]}…")
         clip_path = os.path.join(clips_dir, sid + ".mp4")
         audio_path = os.path.join(audio_dir, sid + ".wav")
 
@@ -373,11 +387,29 @@ def main():
             if os.path.isfile(clip_path) and not args.force:
                 print("    已有视频片段，跳过生成（--force 可重做）")
             else:
+                img_path = None
+                if chain and scene_id == prev_scene and prev_frame and os.path.isfile(prev_frame):
+                    img_path = prev_frame
+                    print("    首帧接续上一镜头末尾画面")
+                elif lock and portraits:
+                    img_path = portrait_for(shot)
+                    if img_path:
+                        print(f"    首帧使用角色定妆照")
                 try:
-                    generate_video_clip(config, shot, clip_path, portrait_for(shot))
+                    generate_video_clip(config, shot, clip_path, img_path)
                 except RuntimeError as exc:
                     print(f"[错误] {exc}", file=sys.stderr)
                     sys.exit(1)
+
+        if chain:
+            frame_path = os.path.join(frames_dir, sid + "_last.png")
+            try:
+                extract_last_frame(clip_path, frame_path)
+                prev_frame = frame_path
+            except subprocess.CalledProcessError:
+                print(f"[警告] 镜头 {sid} 末帧抽取失败，下一镜头回退定妆照/文生视频", file=sys.stderr)
+                prev_frame = None
+        prev_scene = scene_id
 
         if os.path.isfile(audio_path) and not args.force:
             print("    已有配音，跳过")
