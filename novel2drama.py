@@ -101,13 +101,19 @@ SYSTEM_PROMPT = """你是一位经验丰富的短剧编剧。你的任务是把�
 6. 只输出 JSON，第一个字符必须是 { ，最后一个字符必须是 } 。"""
 
 CONTINUATION_PROMPT = """\n\n【续写说明】这是同一部小说的后续片段，前面已改编的场景请勿重复输出。
-scene_id 从 %d 继续编号，characters 列表仍然要完整输出（包含新角色）。"""
+scene_id 从 %d 继续编号。
+已有角色表如下，其中同一人的称呼必须归一到"角色名"字段，绝不能为同一人物另起新名：
+%s
+characters 列表仍然要完整输出（包含新角色）。"""
 
 
-def build_user_prompt(text, next_scene_id):
+def build_user_prompt(text, next_scene_id, characters=None):
     prompt = "请把下面的小说文本改编为剧本 JSON：\n\n" + text.strip()
     if next_scene_id > 1:
-        prompt += CONTINUATION_PROMPT % next_scene_id
+        listing = json.dumps(
+            [{"角色名": c.get("name"), "称谓别名需归一到角色名": c.get("desc", "")} for c in (characters or [])],
+            ensure_ascii=False)
+        prompt += CONTINUATION_PROMPT % (next_scene_id, listing)
     return prompt
 
 
@@ -318,7 +324,8 @@ def novel_to_episode(text, config):
     next_scene_id = 1
     for i, chunk in enumerate(chunks, 1):
         print(f"[信息] 正在改编第 {i}/{len(chunks)} 块…")
-        content = call_llm(config, build_user_prompt(chunk, next_scene_id))
+        known = episodes[-1].get("characters", []) if episodes else []
+        content = call_llm(config, build_user_prompt(chunk, next_scene_id, known))
         episode = extract_json(content)
         episode = validate_episode(episode)
         scenes = episode.get("scenes", [])
