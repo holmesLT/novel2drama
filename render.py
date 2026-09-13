@@ -217,7 +217,23 @@ def extract_last_frame(clip_path, out_path):
     )
 
 
-FONT_FILE = "/System/Library/Fonts/PingFang.ttc"  # macOS 中文字体
+FONT_CANDIDATES = [  # macOS 中文字体候选（不同系统版本路径不同）
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+]
+
+
+def find_font(config=None):
+    """按配置和候选列表找到第一个存在的中文字体；找不到返回 None（不烧字幕）。"""
+    candidates = []
+    if config and config.get("font"):
+        candidates.append(config["font"])
+    candidates += FONT_CANDIDATES
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def drawtext_escape(text):
@@ -227,7 +243,7 @@ def drawtext_escape(text):
     return text
 
 
-def build_segment(clip_path, audio_path, out_path, dialogues=None):
+def build_segment(clip_path, audio_path, out_path, dialogues=None, font_file=None):
     """把一个镜头标准化为统一编码参数的片段（音画对齐、静音补足、烧录台词字幕）。"""
     dur = probe_duration(clip_path)
     if audio_path and os.path.isfile(audio_path):
@@ -240,7 +256,7 @@ def build_segment(clip_path, audio_path, out_path, dialogues=None):
         amap = "1:a"
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", clip_path, *ainput]
     vf = []
-    if dialogues and os.path.isfile(FONT_FILE):
+    if dialogues and font_file:
         n = len(dialogues)
         for k, line in enumerate(dialogues):
             text = drawtext_escape(line.get("text", ""))
@@ -249,7 +265,7 @@ def build_segment(clip_path, audio_path, out_path, dialogues=None):
             if end <= start:
                 continue
             vf.append(
-                f"drawtext=fontfile={FONT_FILE}:text='{text}':"
+                f"drawtext=fontfile={font_file}:text='{text}':"
                 f"fontsize=40:fontcolor=white:borderw=2:bordercolor=black@0.7:"
                 f"x=(w-text_w)/2:y=h-text_h-40:enable='between(t,{start:.2f},{end:.2f})'"
             )
@@ -430,6 +446,9 @@ def main():
 
     segments = []
     chain = args.chain or bool(config.get("chain_shots"))
+    font_file = find_font(config) if config.get("subtitles", True) else None
+    if config.get("subtitles", True) and not font_file:
+        print("[警告] 未找到可用中文字体，本次不烧录字幕（可用 config 的 font 字段指定字体文件路径）", file=sys.stderr)
     prev_scene = None
     prev_frame = None
     for i, (scene_id, shot) in enumerate(scene_shots, 1):
@@ -483,7 +502,7 @@ def main():
         seg_path = os.path.join(build_dir, f"{i:03d}_{sid}.mp4")
         dialogues = shot.get("dialogue") if config.get("subtitles", True) else None
         try:
-            build_segment(clip_path, audio_path, seg_path, dialogues)
+            build_segment(clip_path, audio_path, seg_path, dialogues, font_file)
         except subprocess.CalledProcessError as exc:
             print(f"[错误] 镜头 {sid} 音画合成失败：{exc}", file=sys.stderr)
             sys.exit(1)
