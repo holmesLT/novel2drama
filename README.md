@@ -107,6 +107,15 @@ python3 render.py output/sample_novel.storyboard.json
 - `glm-tts` 后端：通过 `voices` 字段给每个角色分配不同音色（`tongtong`/`xiaochen` 等）；
 - `macsay` 后端（免费）：macOS 没有男声中文音色，通过 `macsay_voices` 给角色设置 `pitch`（如男角色 `0.78` 降调变声）解决音色单一问题。
 
+**成片完成度**（`config.json` 可配）：
+
+| 功能 | 配置 | 说明 |
+| --- | --- | --- |
+| 台词字幕 | `subtitles: true` | 台词自动烧录到画面底部（需带字幕滤镜的 ffmpeg，macOS 用 `brew install ffmpeg-full`） |
+| 配乐/环境音 | `bgm: auto` | 程序化生成风雪环境音（免版权）；也可填音乐文件路径，`bgm_volume` 控制音量 |
+| 画风锁定 | 自动 | 第二步为全片生成统一的 `style` 画风描述，嵌入每个镜头，避免画风漂移 |
+| 碎剪节奏 | 自动 | 分镜默认 2~6 秒/镜头，信息量大的对话拆分到多个镜头 |
+
 ## 📖 使用自己的小说
 
 ```bash

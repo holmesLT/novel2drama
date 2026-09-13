@@ -27,6 +27,7 @@ STORYBOARD_SYSTEM_PROMPT = """你是一位专业的短剧分镜师。你的任�
 你必须只输出一个 JSON 对象，不要输出任何解释或 markdown 标记。JSON 结构如下：
 
 {
+  "style": "全片统一画风，如：写实古装剧质感，电影级调色，35mm胶片感",
   "environment": "本场景环境锁定：地点陈设、光照、天气、色调，40字以内，供所有镜头共用",
   "shots": [
     {
@@ -44,15 +45,16 @@ STORYBOARD_SYSTEM_PROMPT = """你是一位专业的短剧分镜师。你的任�
 
 分镜要求：
 1. shot_id 格式为 S{场景号}-{两位序号}，例如 S3-01、S3-02。
-2. 每个镜头 duration_sec 在 3 到 8 秒之间；台词按正常语速估算时长，一行短台词约 2-4 秒。
-3. shot_type 使用景别（远景/全景/中景/近景/特写）或运镜（推、拉、摇、跟）。
-4. environment（环境锁定）：先用一句话确定本场景的固定环境（地点陈设、光照来源、天气、色调），所有镜头共用，确保同一场景看起来是同一个地方。
-5. video_prompt 必须自包含：把 environment 原文、景别、主体、动作、光线、氛围整合成一段完整描述，不依赖其他镜头的上下文；风格关键词参考全片视觉风格。
-6. 人物形象一致性：凡镜头画面中出现某角色，必须把该角色 appearance 字段的原文一字不差地嵌入 video_prompt 中，并紧跟在角色名之后；appearance 原文是保证跨镜头人物形象一致的唯一手段，绝不可改写、缩写或省略。纯景物/空镜镜头无需嵌入。
-7. 台词分配：每句台词必须放在说话人可见的近景/特写镜头中（或至少是说话人位于画面主体位置的中景），不要把台词放在纯景物或说话人不在画面的镜头上。
-8. 场景 beats 中所有台词必须分配到某个镜头的 dialogue 里，顺序不变；不要新增剧本中不存在的台词，也不要改动台词原文。
-9. 画面描述必须符合物理逻辑和空间常识（人物站在地板上而不是家具上、物体位置前后一致）；同一场景中角色的外貌特征要保持一致。
-10. 只输出 JSON，第一个字符必须是 { ，最后一个字符必须是 } 。"""
+2. 节奏要碎：每个镜头 duration_sec 在 2 到 6 秒之间，一场戏多分几个镜头（特写、反应镜头、细节空镜穿插）；台词按正常语速估算时长，一行短台词约 2-4 秒。信息量大的对话拆到多个镜头，避免一个镜头塞多句台词。
+3. shot_type 使用景别（远景/全景/中景/近景/特写）或运镜（推、拉、摇、跟）；相邻镜头的景别要有变化，避免连续同景别。
+4. style（画风锁定）：用一句话确定全片统一的视觉风格（写实影视质感、调色风格），所有镜头共用，确保成片像同一部剧。
+5. environment（环境锁定）：先用一句话确定本场景的固定环境（地点陈设、光照来源、天气、色调），所有镜头共用，确保同一场景看起来是同一个地方。
+6. video_prompt 必须自包含：把 style、environment 原文、景别、主体、动作、光线、氛围整合成一段完整描述，不依赖其他镜头的上下文。
+7. 人物形象一致性：凡镜头画面中出现某角色，必须把该角色 appearance 字段的原文一字不差地嵌入 video_prompt 中，并紧跟在角色名之后；appearance 原文是保证跨镜头人物形象一致的唯一手段，绝不可改写、缩写或省略。纯景物/空镜镜头无需嵌入。
+8. 台词分配：每句台词必须放在说话人可见的近景/特写镜头中（或至少是说话人位于画面主体位置的中景），不要把台词放在纯景物或说话人不在画面的镜头上。
+9. 场景 beats 中所有台词必须分配到某个镜头的 dialogue 里，顺序不变；不要新增剧本中不存在的台词，也不要改动台词原文。
+10. 画面描述必须符合物理逻辑和空间常识（人物站在地板上而不是家具上、物体位置前后一致）；同一场景中角色的外貌特征要保持一致。
+11. 只输出 JSON，第一个字符必须是 { ，最后一个字符必须是 } 。"""
 
 
 def build_scene_prompt(scene, episode, scene_no):
@@ -79,7 +81,7 @@ def build_scene_prompt(scene, episode, scene_no):
 # 校验与渲染
 # ---------------------------------------------------------------------------
 
-def validate_shots(shots, scene_no, characters, environment):
+def validate_shots(shots, scene_no, characters, environment, style):
     """characters: {name: appearance} 映射。返回 (shots, problems)。"""
     problems = []
     seen_ids = set()
@@ -96,6 +98,10 @@ def validate_shots(shots, scene_no, characters, environment):
         if not prompt:
             problems.append(f"镜头 {sid} 缺少 video_prompt")
             continue
+        if style and style[:8] not in prompt:
+            prompt = f"{style}。{prompt}"
+            shot["video_prompt"] = prompt
+            problems.append(f"镜头 {sid} 的 video_prompt 漏嵌画风锁定，已自动补写")
         if environment and environment[:12] not in prompt:
             shot["video_prompt"] = f"场景环境：{environment}。" + prompt
             problems.append(f"镜头 {sid} 的 video_prompt 漏嵌环境锁定，已自动补写")
@@ -190,7 +196,10 @@ def episode_to_storyboard(episode):
         result = n2d.extract_json(content)
         shots = result.get("shots", [])
         environment = result.get("environment", "")
-        shots, problems = validate_shots(shots, scene_no, characters, environment)
+        style = result.get("style", "")
+        if style and not storyboard.get("style"):
+            storyboard["style"] = style
+        shots, problems = validate_shots(shots, scene_no, characters, environment, style)
         for p in problems:
             print(f"[警告] {p}", file=sys.stderr)
         all_problems += problems

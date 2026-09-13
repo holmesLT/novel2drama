@@ -217,8 +217,18 @@ def extract_last_frame(clip_path, out_path):
     )
 
 
-def build_segment(clip_path, audio_path, out_path):
-    """把一个镜头标准化为统一编码参数的片段（音画对齐、静音补足）。"""
+FONT_FILE = "/System/Library/Fonts/PingFang.ttc"  # macOS 中文字体
+
+
+def drawtext_escape(text):
+    """转义 drawtext 滤镜的特殊字符。"""
+    for ch in ("\\", ":", "'", ",", "%", "[", "]"):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
+def build_segment(clip_path, audio_path, out_path, dialogues=None):
+    """把一个镜头标准化为统一编码参数的片段（音画对齐、静音补足、烧录台词字幕）。"""
     dur = probe_duration(clip_path)
     if audio_path and os.path.isfile(audio_path):
         afilter = f"[1:a]apad=whole_dur={dur + 0.5}[a]"
@@ -229,6 +239,22 @@ def build_segment(clip_path, audio_path, out_path):
         ainput = ["-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono"]
         amap = "1:a"
     cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", clip_path, *ainput]
+    vf = []
+    if dialogues and os.path.isfile(FONT_FILE):
+        n = len(dialogues)
+        for k, line in enumerate(dialogues):
+            text = drawtext_escape(line.get("text", ""))
+            start = k * dur / n + 0.15
+            end = (k + 1) * dur / n - 0.05
+            if end <= start:
+                continue
+            vf.append(
+                f"drawtext=fontfile={FONT_FILE}:text='{text}':"
+                f"fontsize=40:fontcolor=white:borderw=2:bordercolor=black@0.7:"
+                f"x=(w-text_w)/2:y=h-text_h-40:enable='between(t,{start:.2f},{end:.2f})'"
+            )
+    if vf:
+        cmd += ["-vf", ",".join(vf)]
     if afilter:
         cmd += ["-filter_complex", afilter, "-map", "0:v", "-map", amap]
     else:
@@ -238,6 +264,35 @@ def build_segment(clip_path, audio_path, out_path):
             "-c:a", "aac", "-b:a", "128k", "-ar", "24000", "-ac", "1",
             "-movflags", "+faststart", out_path]
     subprocess.run(cmd, check=True)
+
+
+def make_ambience(out_path, duration=120):
+    """程序化生成风雪环境音（免版权，作为默认 BGM）。"""
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", f"anoisesrc=color=pink:sample_rate=24000:amplitude=0.6:duration={duration}",
+         "-af", "highpass=f=80,lowpass=f=500,tremolo=f=0.25:d=0.8,volume=0.5",
+         "-c:a", "pcm_s16le", out_path],
+        check=True,
+    )
+
+
+def mix_bgm(final_path, bgm_path, volume):
+    """把 BGM 循环混入成片（压低音量，首尾淡入淡出）。"""
+    dur = probe_duration(final_path)
+    fade_start = max(0, dur - 3)
+    tmp = final_path + ".bgm.mp4"
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-i", final_path, "-stream_loop", "-1", "-i", bgm_path,
+         "-filter_complex",
+         f"[1:a]volume={volume},afade=t=in:d=2,afade=t=out:st={fade_start:.2f}:d=3[b];"
+         f"[0:a][b]amix=inputs=2:duration=first:normalize=0[a]",
+         "-map", "0:v", "-map", "[a]", "-c:v", "copy",
+         "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", tmp],
+        check=True,
+    )
+    os.replace(tmp, final_path)
 
 
 def concat_segments(segment_paths, out_path, workdir):
@@ -426,8 +481,9 @@ def main():
             audio_path = None
 
         seg_path = os.path.join(build_dir, f"{i:03d}_{sid}.mp4")
+        dialogues = shot.get("dialogue") if config.get("subtitles", True) else None
         try:
-            build_segment(clip_path, audio_path, seg_path)
+            build_segment(clip_path, audio_path, seg_path, dialogues)
         except subprocess.CalledProcessError as exc:
             print(f"[错误] 镜头 {sid} 音画合成失败：{exc}", file=sys.stderr)
             sys.exit(1)
@@ -436,6 +492,22 @@ def main():
     final_path = os.path.join(workdir, stem + ".成片.mp4")
     print("[拼接] 合成成片…")
     concat_segments(segments, final_path, workdir)
+
+    bgm = config.get("bgm")
+    if bgm:
+        bgm_path = os.path.join(workdir, "ambience.wav") if bgm == "auto" else bgm
+        if bgm == "auto" and not os.path.isfile(bgm_path):
+            print("[混音] 生成风雪环境音…")
+            make_ambience(bgm_path)
+        if os.path.isfile(bgm_path):
+            print("[混音] 加入背景音…")
+            try:
+                mix_bgm(final_path, bgm_path, float(config.get("bgm_volume", 0.18)))
+            except subprocess.CalledProcessError as exc:
+                print(f"[警告] BGM 混音失败，输出无配乐版本：{exc}", file=sys.stderr)
+        else:
+            print(f"[警告] BGM 文件不存在：{bgm_path}", file=sys.stderr)
+
     dur = probe_duration(final_path)
     size_mb = os.path.getsize(final_path) / 1024 / 1024
     print(f"[完成] 成片：{final_path}")
