@@ -112,9 +112,17 @@ def generate_video_clip(config, shot, out_path, portrait_path=None):
                 raise RuntimeError(f"任务 {task_id} 成功但没有视频 URL")
             url = videos[0]["url"]
             print(f"    生成完成，下载中…")
-            with n2d.urlopen_with_retry(urllib.request.Request(url)) as response, \
-                    open(out_path, "wb") as f:
-                f.write(response.read())
+            for attempt in (1, 2, 3):
+                try:
+                    with n2d.urlopen_with_retry(urllib.request.Request(url), timeout=300) as response, \
+                            open(out_path, "wb") as f:
+                        f.write(response.read())
+                    break
+                except (TimeoutError, urllib.error.URLError) as exc:
+                    if attempt == 3:
+                        raise RuntimeError(f"视频下载连续失败（任务 {task_id}）：{exc}") from exc
+                    print(f"    下载超时，重试 {attempt}/3…")
+                    time.sleep(5 * attempt)
             return
         if status == "FAIL":
             raise RuntimeError(f"视频生成失败（任务 {task_id}）：{json.dumps(result, ensure_ascii=False)[:300]}")
