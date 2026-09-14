@@ -314,6 +314,67 @@ DEMO_EPISODE = {
 # 主流程
 # ---------------------------------------------------------------------------
 
+RECONCILE_SYSTEM_PROMPT = """你是影视项目的剧本统筹。给你一份角色表和台词中实际出现、但不在角色表里的称呼。
+请判断每个称呼其实是角色表中的哪一个角色（同一人的别称、称谓、头衔都应归并），若确实是新角色则列入新角色。
+只输出 JSON 对象：
+{"映射": {"不在表中的称呼": "角色表中的角色名或新角色名"},
+ "新角色": [{"name": "新角色名", "desc": "一句话描述", "appearance": "锁定外貌：国籍/族群、年龄段、发型发色、五官特征、主要服装，40字以内"}]}
+没有需要处理的就输出 {"映射": {}, "新角色": []} 。只输出 JSON。"""
+
+
+def reconcile_characters(episode, config):
+    """台词角色与角色表对不上时，请 LLM 做一次归并校对（剧统筹）。"""
+    table_names = {c.get("name") for c in episode.get("characters", [])}
+    spoken = {b.get("character") for s in episode.get("scenes", [])
+              for b in s.get("beats", []) if b.get("type") == "dialogue" and b.get("character")}
+    missing = sorted(name for name in spoken if name and name not in table_names)
+    if not missing:
+        return
+
+    prompt = (
+        "角色表：" + json.dumps(
+            [{"角色名": c.get("name"), "描述": c.get("desc", "")} for c in episode.get("characters", [])],
+            ensure_ascii=False)
+        + "\n\n台词中出现但不在角色表里的称呼：" + json.dumps(missing, ensure_ascii=False)
+        + "\n\n请输出归并方案 JSON。"
+    )
+    try:
+        content = call_llm(config, prompt, system_prompt=RECONCILE_SYSTEM_PROMPT, timeout=120)
+        result = extract_json(content)
+    except (RuntimeError, ValueError) as exc:
+        print(f"[警告] 角色归并校对失败（可手动编辑 episode.json 修复）：{exc}", file=sys.stderr)
+        return
+
+    mapping = result.get("映射", {}) or {}
+    for old, new in mapping.items():
+        if not old or not new or old == new:
+            continue
+        target = next((c for c in episode["characters"] if c.get("name") == new), None)
+        for scene in episode["scenes"]:
+            for beat in scene.get("beats", []):
+                if beat.get("type") == "dialogue" and beat.get("character") == old:
+                    beat["character"] = new
+        if target is None:
+            for c in result.get("新角色", []):
+                if c.get("name") == new:
+                    episode.setdefault("characters", []).append(c)
+                    break
+        else:  # 归并到已有角色：补全较弱的描述
+            source = next((c for c in episode["characters"] if c.get("name") == old), None)
+            if source and len(source.get("appearance", "")) > len(target.get("appearance", "")):
+                target["appearance"] = source["appearance"]
+            episode["characters"] = [c for c in episode["characters"] if c.get("name") != old]
+        print(f"[归并] 台词角色「{old}」→「{new}」")
+
+    # 最终一致性检查
+    table_names = {c.get("name") for c in episode.get("characters", [])}
+    leftover = {b.get("character") for s in episode.get("scenes", [])
+                for b in s.get("beats", []) if b.get("type") == "dialogue"} - table_names
+    leftover.discard(None)
+    if leftover:
+        print(f"[警告] 仍有台词角色不在角色表：{sorted(leftover)}，请人工检查 episode.json", file=sys.stderr)
+
+
 def novel_to_episode(text, config):
     """把小说文本改编为剧本 dict。超过长度上限会自动分块、逐块改编再合并。"""
     chunks = chunk_text(text)
@@ -344,6 +405,7 @@ def novel_to_episode(text, config):
         for c in ep.get("characters", []):
             if c.get("name") not in existing:
                 merged.setdefault("characters", []).append(c)
+    reconcile_characters(merged, config)
     return merged
 
 
