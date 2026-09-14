@@ -6,6 +6,8 @@
   "image_model": "cogview-3-flash",
   "lock_characters": true,
   "chain_shots": true,
+  "aspect": "16:9",
+  "intro_outro": true,
   "subtitles": true,
   "bgm": "auto",
   "bgm_volume": 0.18,

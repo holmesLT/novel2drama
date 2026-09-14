@@ -76,11 +76,12 @@ def generate_video_clip(config, shot, out_path, portrait_path=None):
 
     portrait_path 非空时使用图生视频：定妆照作为首帧，锁定人物形象。
     """
+    aspect = config.get("aspect", "16:9")
     payload = {
         "model": config.get("video_model", "cogvideox-flash"),
         "prompt": shot.get("video_prompt", "")[:PROMPT_MAX],
         "quality": "speed",
-        "size": "1920x1080",
+        "size": "1080x1920" if aspect == "9:16" else "1920x1080",
     }
     if config.get("video_model", "").startswith("cogvideox-3"):
         payload["duration"] = 5 if shot.get("duration_sec", 5) <= 5 else 10
@@ -293,6 +294,39 @@ def make_ambience(out_path, duration=120):
     )
 
 
+def probe_resolution(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", path],
+        capture_output=True, text=True, check=True,
+    )
+    w, h = result.stdout.strip().split("x")
+    return int(w), int(h)
+
+
+def make_title_card(out_path, title, subtitle, w, h, font, dur=2.5):
+    """生成片头/片尾卡（深色底 + 标题文字 + 淡入淡出）。"""
+    end = dur - 0.6
+    vf = [
+        f"drawtext=fontfile={font}:text='{drawtext_escape(title)}':"
+        f"fontsize={int(h * 0.06)}:fontcolor=white:borderw=2:bordercolor=black@0.6:"
+        f"x=(w-text_w)/2:y=(h-text_h)/2-{int(h * 0.02)}",
+        f"drawtext=fontfile={font}:text='{drawtext_escape(subtitle)}':"
+        f"fontsize={int(h * 0.025)}:fontcolor=white@0.7:"
+        f"x=(w-text_w)/2:y=(h-text_h)/2+{int(h * 0.05)}",
+        f"fade=t=in:st=0:d=0.5,fade=t=out:st={end}:d=0.5",
+    ]
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", f"color=c=0x14141c:s={w}x{h}:r=30:d={dur}",
+         "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+         "-vf", ",".join(vf), "-shortest",
+         "-c:v", "libx264", "-preset", "fast", "-crf", "20", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", "128k", "-ar", "24000", "-ac", "1", out_path],
+        check=True,
+    )
+
+
 def mix_bgm(final_path, bgm_path, volume):
     """把 BGM 循环混入成片（压低音量，首尾淡入淡出）。"""
     dur = probe_duration(final_path)
@@ -340,10 +374,13 @@ def main():
     parser.add_argument("--skip-video", action="store_true", help="跳过视频生成，使用已有片段")
     parser.add_argument("--lock", action="store_true", help="定妆照锁定：为角色生成定妆照，人物镜头改用图生视频（也可在 config 里设 lock_characters: true）")
     parser.add_argument("--chain", action="store_true", help="尾帧接续：同一场景内，下一镜头以上一镜头的末帧为首帧（也可在 config 里设 chain_shots: true）")
+    parser.add_argument("--aspect", choices=("16:9", "9:16"), help="画面比例：16:9 横屏 / 9:16 竖屏（也可在 config 里设 aspect）")
     parser.add_argument("--config", help="配置文件路径")
     args = parser.parse_args()
 
     config = n2d.load_config(args.config)
+    if args.aspect:
+        config["aspect"] = args.aspect
 
     try:
         with open(args.input, "r", encoding="utf-8") as f:
@@ -510,7 +547,23 @@ def main():
 
     final_path = os.path.join(workdir, stem + ".成片.mp4")
     print("[拼接] 合成成片…")
-    concat_segments(segments, final_path, workdir)
+
+    # 片头/片尾卡
+    ordered = list(segments)
+    if config.get("intro_outro", True) and font_file:
+        try:
+            w, h = probe_resolution(segments[0])
+            intro = os.path.join(build_dir, "000_片头.mp4")
+            outro = os.path.join(build_dir, "999_片尾.mp4")
+            make_title_card(intro, storyboard.get("title", "未命名"),
+                            "novel2drama · AI 短剧工作流", w, h, font_file, dur=2.5)
+            make_title_card(outro, "剧终", storyboard.get("title", ""), w, h, font_file, dur=2.2)
+            ordered = [intro] + ordered + [outro]
+            print("    片头/片尾卡已生成")
+        except (subprocess.CalledProcessError, ValueError) as exc:
+            print(f"[警告] 片头片尾生成失败，跳过：{exc}", file=sys.stderr)
+
+    concat_segments(ordered, final_path, workdir)
 
     bgm = config.get("bgm")
     if bgm:

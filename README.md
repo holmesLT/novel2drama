@@ -71,6 +71,13 @@ python3 storyboard.py output/sample_novel.episode.json
 python3 render.py output/sample_novel.storyboard.json
 ```
 
+**或者一条命令跑完整条流水线**（小说 → 剧本 → 分镜 → 成片）：
+
+```bash
+python3 pipeline.py examples/sample_novel.txt
+python3 pipeline.py examples/sample_novel.txt --aspect 9:16   # 竖屏短剧格式
+```
+
 流程：每个镜头调用视频生成模型（默认 `cogvideox-flash`，**免费**）生成视频片段 → 台词配音 → FFmpeg 按顺序合成成片。结果在 `output/render_sample_novel/`：
 
 - `sample_novel.成片.mp4` —— 最终成片
@@ -115,6 +122,8 @@ python3 render.py output/sample_novel.storyboard.json
 | 配乐/环境音 | `bgm: auto` | 程序化生成风雪环境音（免版权）；也可填音乐文件路径，`bgm_volume` 控制音量 |
 | 画风锁定 | 自动 | 第二步为全片生成统一的 `style` 画风描述，嵌入每个镜头，避免画风漂移 |
 | 碎剪节奏 | 自动 | 分镜默认 2~6 秒/镜头，信息量大的对话拆分到多个镜头 |
+| 横竖屏 | `aspect: 16:9` / `9:16` | 竖屏用于抖音/快手等短视频平台，支持 `--aspect` 命令行覆盖 |
+| 片头片尾 | `intro_outro: true` | 自动生成标题卡和剧终卡，带淡入淡出 |
 
 ## 📖 使用自己的小说
 
