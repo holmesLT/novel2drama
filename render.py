@@ -426,6 +426,11 @@ def main():
     frames_dir = os.path.join(workdir, "frames")
     for d in (clips_dir, audio_dir, build_dir, frames_dir):
         os.makedirs(d, exist_ok=True)
+    # 拼接片段每次全量重建；清掉旧文件，避免历史残留（含损坏文件）混进本次拼接
+    for stale in os.listdir(build_dir):
+        path = os.path.join(build_dir, stale)
+        if os.path.isfile(path):
+            os.remove(path)
 
     # 角色音色分配
     voice_map = dict(config.get("voices", {}))
