@@ -131,6 +131,23 @@ def generate_video_clip(config, shot, out_path, portrait_path=None):
         print(f"    生成中…（已等待 {int(time.time() - (deadline - POLL_TIMEOUT))} 秒）")
 
 
+def generate_placeholder_clip(shot, out_path, aspect="16:9"):
+    """demo 模式：用 ffmpeg 生成占位测试视频（不调用任何生成 API，可进 CI）。"""
+    try:
+        dur = min(max(float(shot.get("duration_sec", 5) or 5), 1.0), 10.0)
+    except (TypeError, ValueError):
+        dur = 5.0
+    w, h = (1080, 1920) if aspect == "9:16" else (1920, 1080)
+    label = drawtext_escape(shot.get("shot_id", "shot"))
+    base = ["ffmpeg", "-y", "-loglevel", "error",
+            "-f", "lavfi", "-i", f"testsrc2=s={w}x{h}:r=30:d={dur:.2f}"]
+    with_text = base + ["-vf", f"drawtext=text='{label}':fontsize=80:fontcolor=white:"
+                        "x=(w-text_w)/2:y=(h-text_h)/2"]
+    tail = ["-c:v", "libx264", "-preset", "fast", "-crf", "28",
+            "-pix_fmt", "yuv420p", "-an", out_path]
+    # drawtext 依赖 fontconfig；极端环境下失败则退回无文字占位
+    if subprocess.run(with_text + tail).returncode != 0:
+        subprocess.run(base + tail, check=True)
 def synthesize_dialogue(config, lines, voice_of, macsay_voice_of, out_path):
     """把一个镜头的多句台词合成为一段配音 WAV。
 
@@ -226,10 +243,14 @@ def extract_last_frame(clip_path, out_path):
     )
 
 
-FONT_CANDIDATES = [  # macOS 中文字体候选（不同系统版本路径不同）
+FONT_CANDIDATES = [  # 中文字体候选（macOS / Linux / Windows 常见路径）
     "/System/Library/Fonts/PingFang.ttc",
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/System/Library/Fonts/STHeiti Light.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/simhei.ttf",
 ]
 
 
@@ -384,6 +405,7 @@ def main():
     parser.add_argument("--chain", action="store_true", help="尾帧接续：同一场景内，下一镜头以上一镜头的末帧为首帧（也可在 config 里设 chain_shots: true）")
     parser.add_argument("--aspect", choices=("16:9", "9:16"), help="画面比例：16:9 横屏 / 9:16 竖屏（也可在 config 里设 aspect）")
     parser.add_argument("--config", help="配置文件路径")
+    parser.add_argument("--demo", action="store_true", help="演示模式：ffmpeg 占位视频代替 AI 生成，不调用任何 API")
     args = parser.parse_args()
 
     config = n2d.load_config(args.config)
@@ -409,8 +431,11 @@ def main():
     if not scene_shots:
         print("[错误] 没有匹配的镜头", file=sys.stderr)
         sys.exit(1)
+    # 全部镜头按分镜顺序（拼接用）；--shots 模式下未选中的镜头复用已有片段
+    all_scene_shots = [(scene.get("scene_id"), shot) for scene in storyboard.get("scenes", [])
+                       for shot in scene.get("shots", [])]
 
-    if not config["api_key"] and not args.skip_video:
+    if not config["api_key"] and not args.skip_video and not args.demo:
         print("[错误] 尚未配置 API Key（需要同时用于视频生成和配音）。", file=sys.stderr)
         sys.exit(1)
     for tool in ("ffmpeg", "ffprobe"):
@@ -426,10 +451,13 @@ def main():
     frames_dir = os.path.join(workdir, "frames")
     for d in (clips_dir, audio_dir, build_dir, frames_dir):
         os.makedirs(d, exist_ok=True)
-    # 拼接片段每次全量重建；清掉旧文件，避免历史残留（含损坏文件）混进本次拼接
+    # 清掉不再属于任何镜头的残留片段（镜头改名/删除后）；当前镜头的片段按 shot_id 缓存复用
+    current_sids = {shot.get("shot_id") or f"shot{i:02d}"
+                    for i, (_, shot) in enumerate(all_scene_shots, 1)}
     for stale in os.listdir(build_dir):
         path = os.path.join(build_dir, stale)
-        if os.path.isfile(path):
+        if os.path.isfile(path) and stale.endswith(".mp4") and stale[:-4] not in current_sids \
+                and not stale.startswith(("000_片头", "999_片尾")):
             os.remove(path)
 
     # 角色音色分配
@@ -457,7 +485,7 @@ def main():
     # 定妆照锁定：人物镜头用图生视频（定妆照作首帧）
     lock = args.lock or bool(config.get("lock_characters"))
     portraits = {}
-    if lock and not args.skip_video:
+    if lock and not args.skip_video and not args.demo:
         portrait_dir = os.path.join(workdir, "characters")
         os.makedirs(portrait_dir, exist_ok=True)
         print(f"[定妆照] 为 {len(storyboard.get('characters', []))} 个角色生成参考图…")
@@ -481,7 +509,8 @@ def main():
         """找出镜头中的人物（台词角色优先），返回其定妆照路径。"""
         names = [d.get("character") for d in shot.get("dialogue", []) if d.get("character")]
         text = shot.get("description", "") + shot.get("video_prompt", "")
-        for name in portraits:
+        # 按名字长度降序扫描，避免"陈默"误命中"陈默默"这类子串
+        for name in sorted(portraits, key=len, reverse=True):
             if name in text and name not in names:
                 names.append(name)
         for name in names:
@@ -501,14 +530,18 @@ def main():
         print("[警告] 未找到可用中文字体，本次不烧录字幕（可用 config 的 font 字段指定字体文件路径）", file=sys.stderr)
     prev_scene = None
     prev_frame = None
-    for i, (scene_id, shot) in enumerate(scene_shots, 1):
+    for i, (scene_id, shot) in enumerate(all_scene_shots, 1):
         sid = shot.get("shot_id", f"shot{i:02d}")
-        print(f"[镜头 {sid}]（{i}/{len(scene_shots)}）{shot.get('description', '')[:40]}…")
+        selected = only is None or sid in only
+        print(f"[镜头 {sid}]（{i}/{len(all_scene_shots)}）{shot.get('description', '')[:40]}…")
         clip_path = os.path.join(clips_dir, sid + ".mp4")
         audio_path = os.path.join(audio_dir, sid + ".wav")
 
-        if not args.skip_video:
-            if os.path.isfile(clip_path) and not args.force:
+        if not args.skip_video and selected:
+            if args.demo:
+                print("    demo 模式：生成占位测试视频")
+                generate_placeholder_clip(shot, clip_path, config.get("aspect", "16:9"))
+            elif os.path.isfile(clip_path) and not args.force:
                 print("    已有视频片段，跳过生成（--force 可重做）")
             else:
                 img_path = None
@@ -525,7 +558,7 @@ def main():
                     print(f"[错误] {exc}", file=sys.stderr)
                     sys.exit(1)
 
-        if chain:
+        if chain and os.path.isfile(clip_path):
             frame_path = os.path.join(frames_dir, sid + "_last.png")
             try:
                 extract_last_frame(clip_path, frame_path)
@@ -535,9 +568,13 @@ def main():
                 prev_frame = None
         prev_scene = scene_id
 
+        if not os.path.isfile(clip_path):
+            print(f"[警告] 镜头 {sid} 没有视频片段（不在 --shots 列表且无缓存），未包含在成片中", file=sys.stderr)
+            continue
+
         if os.path.isfile(audio_path) and not args.force:
             print("    已有配音，跳过")
-        elif shot.get("dialogue"):
+        elif shot.get("dialogue") and not args.demo:
             print(f"    生成配音（{len(shot['dialogue'])} 句台词）…")
             try:
                 has_audio = synthesize_dialogue(config, shot["dialogue"], voice_of, macsay_voice_of, audio_path)
@@ -549,8 +586,17 @@ def main():
         else:
             audio_path = None
 
-        seg_path = os.path.join(build_dir, f"{i:03d}_{sid}.mp4")
+        seg_path = os.path.join(build_dir, sid + ".mp4")
         dialogues = shot.get("dialogue") if config.get("subtitles", True) else None
+        # 片段缓存：镜头号即缓存键；分镜/视频/配音比片段新时自动重建（编辑后刷新）
+        if os.path.isfile(seg_path) and not args.force:
+            src_mtimes = [os.path.getmtime(p) for p in (clip_path, args.input) if os.path.isfile(p)]
+            if audio_path and os.path.isfile(audio_path):
+                src_mtimes.append(os.path.getmtime(audio_path))
+            if src_mtimes and os.path.getmtime(seg_path) >= max(src_mtimes):
+                segments.append(seg_path)
+                print("    已有标准化片段，跳过（--force 可重做）")
+                continue
         try:
             build_segment(clip_path, audio_path, seg_path, dialogues, font_file)
         except subprocess.CalledProcessError as exc:
@@ -562,10 +608,24 @@ def main():
     print("[拼接] 合成成片…")
 
     # 片头/片尾卡
-    ordered = list(segments)
+    # --shots 模式：未选中的镜头复用已有片段，保证成片完整而不是只剩被重渲的镜头
+    if only is not None:
+        ordered = []
+        for _, shot in all_scene_shots:
+            sid = shot.get("shot_id") or ""
+            seg = os.path.join(build_dir, sid + ".mp4") if sid else None
+            if seg and os.path.isfile(seg):
+                ordered.append(seg)
+            else:
+                print(f"[警告] 镜头 {sid or '?'} 没有可用片段，未包含在成片中", file=sys.stderr)
+    else:
+        ordered = list(segments)
+    if not ordered:
+        print("[错误] 没有任何可用片段，无法合成成片", file=sys.stderr)
+        sys.exit(1)
     if config.get("intro_outro", True) and font_file:
         try:
-            w, h = probe_resolution(segments[0])
+            w, h = probe_resolution(ordered[0])
             intro = os.path.join(build_dir, "000_片头.mp4")
             outro = os.path.join(build_dir, "999_片尾.mp4")
             make_title_card(intro, storyboard.get("title", "未命名"),
@@ -573,13 +633,13 @@ def main():
             make_title_card(outro, "剧终", storyboard.get("title", ""), w, h, font_file, dur=2.2)
             ordered = [intro] + ordered + [outro]
             print("    片头/片尾卡已生成")
-        except (subprocess.CalledProcessError, ValueError) as exc:
+        except (subprocess.CalledProcessError, ValueError, IndexError) as exc:
             print(f"[警告] 片头片尾生成失败，跳过：{exc}", file=sys.stderr)
 
     concat_segments(ordered, final_path, workdir)
 
     bgm = config.get("bgm")
-    if bgm:
+    if bgm and not args.demo:
         bgm_path = os.path.join(workdir, "ambience.wav") if bgm == "auto" else bgm
         if bgm == "auto" and not os.path.isfile(bgm_path):
             print("[混音] 生成风雪环境音…")
