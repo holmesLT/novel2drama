@@ -172,9 +172,9 @@ DEMO_SCENE_SHOTS = {
 
 # ---------------------------------------------------------------------------
 # 主流程
-# ---------------------------------------------------------------------------
 
-def episode_to_storyboard(episode):
+def episode_to_storyboard(episode, cache_dir=None, force=False):
+    """把剧本拆解为分镜。cache_dir 非空时逐场景落盘缓存，中途失败重跑只补未完成的场景。"""
     characters = {c.get("name"): c.get("appearance", "") for c in episode.get("characters", [])}
     storyboard = {
         "title": episode.get("title", ""),
@@ -185,20 +185,33 @@ def episode_to_storyboard(episode):
     }
     all_problems = []
     scenes = episode.get("scenes", [])
+    if cache_dir and len(scenes) > 1:
+        os.makedirs(cache_dir, exist_ok=True)
     for scene in scenes:
         scene_no = scene.get("scene_id", len(storyboard["scenes"]) + 1)
-        print(f"[信息] 正在为场景 {scene_no} 生成分镜…")
-        content = n2d.call_llm(
-            CONFIG,
-            build_scene_prompt(scene, episode, scene_no),
-            system_prompt=STORYBOARD_SYSTEM_PROMPT,
-        )
-        result = n2d.extract_json(content)
-        shots = result.get("shots", [])
+        cache_key = n2d.hashlib.sha1(
+            json.dumps(scene, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+        cache_path = os.path.join(cache_dir, f"scene_{scene_no:03d}.{cache_key}.json") if cache_dir else None
+        if cache_path and os.path.isfile(cache_path) and not force:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                result = json.load(f)
+            print(f"[信息] 场景 {scene_no} 使用缓存，跳过分镜（--force 可重做）")
+        else:
+            print(f"[信息] 正在为场景 {scene_no} 生成分镜…")
+            content = n2d.call_llm(
+                CONFIG,
+                build_scene_prompt(scene, episode, scene_no),
+                system_prompt=STORYBOARD_SYSTEM_PROMPT,
+            )
+            result = n2d.extract_json(content)
+            if cache_path:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(result, f, ensure_ascii=False)
         environment = result.get("environment", "")
         style = result.get("style", "")
         if style and not storyboard.get("style"):
             storyboard["style"] = style
+        shots = result.get("shots", [])
         shots, problems = validate_shots(shots, scene_no, characters, environment, style)
         for p in problems:
             print(f"[警告] {p}", file=sys.stderr)
@@ -218,9 +231,9 @@ def main():
     parser.add_argument("input", help="剧本 JSON 文件（第一步的输出）")
     parser.add_argument("-o", "--output-dir", default="output", help="输出目录（默认 output/）")
     parser.add_argument("--config", help="配置文件路径")
+    parser.add_argument("--force", action="store_true", help="忽略场景缓存，全部重新生成分镜")
     parser.add_argument("--demo", action="store_true", help="演示模式：不调用 API")
     args = parser.parse_args()
-
     global CONFIG
     CONFIG = n2d.load_config(args.config)
 
@@ -251,8 +264,11 @@ def main():
                 file=sys.stderr,
             )
             sys.exit(1)
+        stem = os.path.splitext(os.path.basename(args.input))[0].replace(".episode", "")
         try:
-            storyboard = episode_to_storyboard(episode)
+            # 逐场景缓存落盘到 <输出目录>/.scenes/<输入名>/，重跑只补未完成的场景
+            cache_dir = os.path.join(args.output_dir, ".scenes", stem)
+            storyboard = episode_to_storyboard(episode, cache_dir=cache_dir, force=args.force)
         except RuntimeError as exc:
             print(f"[错误] {exc}", file=sys.stderr)
             sys.exit(1)

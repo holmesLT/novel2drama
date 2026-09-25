@@ -12,11 +12,13 @@ novel2drama —— 把小说文本改编为结构化短剧剧本（第一步：�
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import ssl
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -30,6 +32,7 @@ DEFAULT_CONFIG = {
     "api_base": "https://open.bigmodel.cn/api/paas/v4",
     "api_key": "",
     "model": "glm-4-flash",
+    "temperature": 0.7,
 }
 
 CONFIG_FILENAMES = ("config.json",)
@@ -99,21 +102,22 @@ SYSTEM_PROMPT = """你是一位经验丰富的短剧编剧。你的任务是把�
 4. 角色名必须出现在 characters 列表中。
 5. appearance（锁定外貌）必须符合小说的时代与地域设定，例如中国现代都市故事的角色使用中国面孔；全剧所有场景共用同一份外貌描述，措辞不得变化，这是保证跨镜头人物形象一致的关键。
 6. 只输出 JSON，第一个字符必须是 { ，最后一个字符必须是 } 。"""
-
 CONTINUATION_PROMPT = """\n\n【续写说明】这是同一部小说的后续片段，前面已改编的场景请勿重复输出。
 scene_id 从 %d 继续编号。
+前文剧情摘要（仅供衔接上下文，不要重复改编）：
+%s
 已有角色表如下，其中同一人的称呼必须归一到"角色名"字段，绝不能为同一人物另起新名：
 %s
 characters 列表仍然要完整输出（包含新角色）。"""
 
 
-def build_user_prompt(text, next_scene_id, characters=None):
+def build_user_prompt(text, next_scene_id, characters=None, synopsis=None):
     prompt = "请把下面的小说文本改编为剧本 JSON：\n\n" + text.strip()
     if next_scene_id > 1:
         listing = json.dumps(
             [{"角色名": c.get("name"), "称谓别名需归一到角色名": c.get("desc", "")} for c in (characters or [])],
             ensure_ascii=False)
-        prompt += CONTINUATION_PROMPT % (next_scene_id, listing)
+        prompt += CONTINUATION_PROMPT % (next_scene_id, synopsis or "（无）", listing)
     return prompt
 
 
@@ -142,7 +146,8 @@ def urlopen_with_retry(request, timeout=180):
         raise
 
 
-def call_llm(config, user_prompt, timeout=180, system_prompt=SYSTEM_PROMPT):
+def call_llm(config, user_prompt, timeout=180, system_prompt=SYSTEM_PROMPT, retries=3):
+    """调用 OpenAI 兼容接口；对限流/服务端错误/网络抖动做指数退避重试。"""
     url = config["api_base"].rstrip("/") + "/chat/completions"
     payload = json.dumps({
         "model": config["model"],
@@ -150,27 +155,43 @@ def call_llm(config, user_prompt, timeout=180, system_prompt=SYSTEM_PROMPT):
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": 0.7,
+        "temperature": float(config.get("temperature", 0.7)),
     }).encode("utf-8")
 
-    request = urllib.request.Request(
-        url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": "Bearer " + config["api_key"],
-        },
-        method="POST",
-    )
+    def build_request():
+        return urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + config["api_key"],
+            },
+            method="POST",
+        )
 
-    try:
-        with urlopen_with_retry(request, timeout=timeout) as response:
-            body = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:500]
-        raise RuntimeError(f"API 请求失败（HTTP {exc.code}）：{detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"无法连接 API（{config['api_base']}）：{exc.reason}") from exc
+    for attempt in range(1, retries + 1):
+        try:
+            with urlopen_with_retry(build_request(), timeout=timeout) as response:
+                body = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+            if exc.code in (408, 409, 429, 500, 502, 503, 504) and attempt < retries:
+                wait = 5 * attempt
+                print(f"[警告] API 请求失败（HTTP {exc.code}），{wait} 秒后重试（{attempt}/{retries - 1}）…",
+                      file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"API 请求失败（HTTP {exc.code}）：{detail}") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            reason = getattr(exc, "reason", exc)
+            if attempt < retries:
+                wait = 5 * attempt
+                print(f"[警告] 无法连接 API（{reason}），{wait} 秒后重试（{attempt}/{retries - 1}）…",
+                      file=sys.stderr)
+                time.sleep(wait)
+                continue
+            raise RuntimeError(f"无法连接 API（{config['api_base']}）：{reason}") from exc
 
     try:
         return body["choices"][0]["message"]["content"]
@@ -218,12 +239,18 @@ def extract_json(text):
 # ---------------------------------------------------------------------------
 
 def chunk_text(text, max_chars=MAX_CHARS_PER_CHUNK):
-    """按空行（段落边界）把长文本切成若干块。"""
+    """按空行（段落边界）把长文本切成若干块；单段超过上限时按句子硬切。"""
     text = text.strip()
     if len(text) <= max_chars:
         return [text]
 
-    paragraphs = re.split(r"\n\s*\n", text)
+    paragraphs = []
+    for para in re.split(r"\n\s*\n", text):
+        if len(para) <= max_chars:
+            paragraphs.append(para)
+        else:
+            paragraphs.extend(_split_long_paragraph(para, max_chars))
+
     chunks, current = [], ""
     for para in paragraphs:
         if current and len(current) + len(para) + 2 > max_chars:
@@ -234,6 +261,27 @@ def chunk_text(text, max_chars=MAX_CHARS_PER_CHUNK):
     if current.strip():
         chunks.append(current.strip())
     return chunks
+
+
+def _split_long_paragraph(para, max_chars):
+    """把超过上限的单段按句子边界硬切开，保证每片都不超过 max_chars。"""
+    sentences = [s for s in re.split(r"(?<=[。！？!?；;…])", para) if s]
+    pieces, current = [], ""
+    for sent in sentences:
+        while len(sent) > max_chars:  # 单句都超长：只能按字符数硬切
+            if current:
+                pieces.append(current)
+                current = ""
+            pieces.append(sent[:max_chars])
+            sent = sent[max_chars:]
+        if current and len(current) + len(sent) > max_chars:
+            pieces.append(current)
+            current = sent
+        else:
+            current += sent
+    if current:
+        pieces.append(current)
+    return pieces
 
 
 # ---------------------------------------------------------------------------
@@ -375,24 +423,47 @@ def reconcile_characters(episode, config):
         print(f"[警告] 仍有台词角色不在角色表：{sorted(leftover)}，请人工检查 episode.json", file=sys.stderr)
 
 
-def novel_to_episode(text, config):
-    """把小说文本改编为剧本 dict。超过长度上限会自动分块、逐块改编再合并。"""
+def novel_to_episode(text, config, cache_dir=None, force=False):
+    """把小说文本改编为剧本 dict。超过长度上限会自动分块、逐块改编再合并。
+
+    cache_dir 非空时，每块的改编结果会落盘缓存；中途失败后重跑只补未完成的块。
+    """
     chunks = chunk_text(text)
     if len(chunks) > 1:
         print(f"[信息] 文本较长，已分为 {len(chunks)} 块逐段改编")
+    if cache_dir and len(chunks) > 1:
+        os.makedirs(cache_dir, exist_ok=True)
 
     episodes = []
     next_scene_id = 1
+    synopsis_lines = []  # 已改编场景的一句话摘要，供后续块衔接剧情
     for i, chunk in enumerate(chunks, 1):
-        print(f"[信息] 正在改编第 {i}/{len(chunks)} 块…")
-        known = episodes[-1].get("characters", []) if episodes else []
-        content = call_llm(config, build_user_prompt(chunk, next_scene_id, known))
-        episode = extract_json(content)
-        episode = validate_episode(episode)
+        cache_key = hashlib.sha1(
+            (config.get("model", "") + "\n" + chunk).encode("utf-8")).hexdigest()[:12]
+        cache_path = os.path.join(cache_dir, f"chunk_{i:03d}.{cache_key}.json") if cache_dir else None
+        if cache_path and os.path.isfile(cache_path) and not force:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                episode = json.load(f)
+            print(f"[信息] 第 {i}/{len(chunks)} 块使用缓存，跳过改编（--force 可重做）")
+        else:
+            print(f"[信息] 正在改编第 {i}/{len(chunks)} 块…")
+            known = episodes[-1].get("characters", []) if episodes else []
+            synopsis = "；".join(synopsis_lines[-8:])  # 只带最近几条，避免提示词膨胀
+            content = call_llm(config, build_user_prompt(chunk, next_scene_id, known, synopsis))
+            episode = extract_json(content)
+            episode = validate_episode(episode)
+            if not episode.get("scenes"):
+                raise RuntimeError(f"第 {i} 块没有改编出任何场景，请重试或检查该块文本")
+            if cache_path:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(episode, f, ensure_ascii=False)
         scenes = episode.get("scenes", [])
         for scene in scenes:
             scene["scene_id"] = next_scene_id
             next_scene_id += 1
+            summary = scene.get("summary")
+            if summary:
+                synopsis_lines.append(f"场景{scene['scene_id']}：{summary}")
         episodes.append(episode)
 
     if not episodes:
@@ -418,9 +489,10 @@ def main():
     parser.add_argument("input", nargs="?", help="小说文本文件（.txt）")
     parser.add_argument("-o", "--output-dir", default="output", help="输出目录（默认 output/）")
     parser.add_argument("--config", help="配置文件路径（默认在当前目录或脚本目录找 config.json）")
+    parser.add_argument("--force", action="store_true", help="忽略分块缓存，全部重新改编")
     parser.add_argument("--demo", action="store_true", help="演示模式：不调用 API，输出内置示例")
-    args = parser.parse_args()
 
+    args = parser.parse_args()
     if args.demo:
         if not args.input:
             parser.error("演示模式也需要一个输入文件，例如: python3 novel2drama.py examples/sample_novel.txt --demo")
@@ -452,7 +524,9 @@ def main():
             sys.exit(1)
 
         try:
-            episode = novel_to_episode(text, config)
+            # 分块结果落盘到 <输出目录>/.chunks/<输入名>/，重跑只补未完成块
+            cache_dir = os.path.join(args.output_dir, ".chunks", os.path.splitext(os.path.basename(args.input))[0])
+            episode = novel_to_episode(text, config, cache_dir=cache_dir, force=args.force)
         except RuntimeError as exc:
             print(f"[错误] {exc}", file=sys.stderr)
             sys.exit(1)

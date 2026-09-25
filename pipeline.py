@@ -50,10 +50,10 @@ def main():
     if args.force:
         pass_through.append("--force")
 
-    run_step("第一步：小说 → 剧本", ["python3", "novel2drama.py", args.input, *pass_through])
-    run_step("第二步：剧本 → 分镜", ["python3", "storyboard.py", episode, *pass_through])
+    run_step("第一步：小说 → 剧本", [sys.executable, "novel2drama.py", args.input, *pass_through])
+    run_step("第二步：剧本 → 分镜", [sys.executable, "storyboard.py", episode, *pass_through])
 
-    render_args = ["python3", "render.py", storyboard, *pass_through]
+    render_args = [sys.executable, "render.py", storyboard, *pass_through]
     if args.aspect:
         render_args += ["--aspect", args.aspect]
     if args.skip_video:
