@@ -9,6 +9,7 @@
 """
 
 import os
+import shutil
 import sys
 import unittest
 
@@ -153,9 +154,9 @@ class TestBuildUserPrompt(unittest.TestCase):
         self.assertIn("林晚", prompt)
 
 
+@unittest.skipUnless(shutil.which("ffmpeg"), "需要 ffmpeg，未安装时跳过")
 class TestPlaceholderClip(unittest.TestCase):
     """demo 占位视频：不调用 API。"""
-
     def test_generates_file(self):
         import tempfile
         out = os.path.join(tempfile.mkdtemp(), "t.mp4")
